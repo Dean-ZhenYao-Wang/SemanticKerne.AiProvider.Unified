@@ -1,0 +1,12 @@
+@Demo_HostAddress = http://localhost:5261
+
+POST {{Demo_HostAddress}}/api/Chat/sessions
+Accept: application/json
+
+###
+POST {{Demo_HostAddress}}/api/Chat/sessions/77e941b8-bb46-478c-ab30-94ac1149f80d/chat
+Content-Type: application/json
+Accept: application/json
+{
+  "message":"你好，介绍下自己"
+}

@@ -1,0 +1,31 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 18
+VisualStudioVersion = 18.4.11626.88
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "SemanticKerne.AiProvider.Unified", "SemanticKerne.AiProvider.Unified.csproj", "{F89A4F7B-AB34-7741-8D84-399B5DA1F69B}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Demo", "Demo\Demo.csproj", "{D1CCB24F-A868-F185-9228-8CC249247C79}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{F89A4F7B-AB34-7741-8D84-399B5DA1F69B}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{F89A4F7B-AB34-7741-8D84-399B5DA1F69B}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{F89A4F7B-AB34-7741-8D84-399B5DA1F69B}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{F89A4F7B-AB34-7741-8D84-399B5DA1F69B}.Release|Any CPU.Build.0 = Release|Any CPU
+		{D1CCB24F-A868-F185-9228-8CC249247C79}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{D1CCB24F-A868-F185-9228-8CC249247C79}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{D1CCB24F-A868-F185-9228-8CC249247C79}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{D1CCB24F-A868-F185-9228-8CC249247C79}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {2F8EE6F4-008C-4101-999F-1210B0F7B841}
+	EndGlobalSection
+EndGlobal
