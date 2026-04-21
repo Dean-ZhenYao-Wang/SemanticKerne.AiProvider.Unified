@@ -74,8 +74,15 @@ builder.Services.AddSingleton<ISemanticKernelService, SemanticKernelService>();
 builder.Services.AddSingleton<ISessionManager, SessionManager>();
 builder.Services.AddSingleton<BailianErrorHandler>();
 
+// 配置 AI 服务的 HttpClient
+builder.Services.AddHttpClient("AIService", client =>
+{
+    client.Timeout = TimeSpan.FromMinutes(5);
+    client.DefaultRequestHeaders.UserAgent.ParseAdd("QW-App/1.0");
+    client.MaxResponseContentBufferSize = 1024 * 1024 * 10; // 10MB
+});
+
 // 注册 MCP 服务
-builder.Services.AddHttpClient();
 builder.Services.AddSingleton<IMcpClientService, McpClientService>(sp =>
 {
     var httpClientFactory = sp.GetRequiredService<IHttpClientFactory>();
@@ -86,408 +93,9 @@ var app = builder.Build();
 app.Run();
 ```
 
-### 3. 使用示例
+### 3. 查看完整示例
 
-```csharp
-/// <summary>
-/// 聊天控制器
-/// </summary>
-[ApiController]
-[Route("api/[controller]")]
-public class ChatController : ControllerBase
-{
-    private readonly ISessionManager _sessionManager;
-    private readonly ISemanticKernelService _kernelService;
-    private readonly ILogger<ChatController> _logger;
-    private readonly BailianErrorHandler _errorHandler;
-
-    public ChatController(
-        ISessionManager sessionManager,
-        ISemanticKernelService kernelService,
-        ILogger<ChatController> logger,
-        BailianErrorHandler errorHandler)
-    {
-        _sessionManager = sessionManager;
-        _kernelService = kernelService;
-        _logger = logger;
-        _errorHandler = errorHandler;
-    }
-
-    private string UserId => User.FindFirst(ClaimTypes.Name)?.Value ?? "test-user";
-
-    /// <summary>
-    /// 获取当前用户的所有会话
-    /// </summary>
-    [HttpGet("sessions")]
-    public IActionResult GetSessions()
-    {
-        _logger.LogInformation("GetSessions called, UserId: {UserId}, AllClaims: {Claims}", 
-            UserId, 
-            string.Join(", ", User.Claims.Select(c => $"{c.Type}={c.Value}")));
-        var sessions = _sessionManager.GetUserSessions(UserId);
-        _logger.LogInformation("GetSessions result, count: {Count}", sessions.Count());
-        return Ok(sessions);
-    }
-
-    /// <summary>
-    /// 创建新的聊天会话
-    /// </summary>
-    [HttpPost("sessions")]
-    public IActionResult CreateSession()
-    {
-        _logger.LogInformation("CreateSession called, UserId: {UserId}", UserId);
-        var session = _sessionManager.CreateSession(UserId);
-        _logger.LogInformation("CreateSession created, SessionId: {SessionId}, UserId: {UserId}", session.SessionId, UserId);
-        return Ok(new CreateSessionResponse
-        {
-            SessionId = session.SessionId,
-            CreatedAt = session.CreatedAt
-        });
-    }
-
-    /// <summary>
-    /// 删除指定的聊天会话
-    /// </summary>
-    [HttpDelete("sessions/{sessionId}")]
-    public IActionResult DeleteSession(string sessionId)
-    {
-        _logger.LogInformation("DeleteSession called, UserId: {UserId}, SessionId: {SessionId}", UserId, sessionId);
-        var result = _sessionManager.DeleteSession(UserId, sessionId);
-        if (!result)
-        {
-            _logger.LogWarning("DeleteSession failed, session not found, UserId: {UserId}, SessionId: {SessionId}", UserId, sessionId);
-            return NotFound(new { message = "会话不存在" });
-        }
-        return NoContent();
-    }
-
-    /// <summary>
-    /// 停止会话当前正在进行的请求（不删除会话）
-    /// </summary>
-    [HttpPost("sessions/{sessionId}/stop")]
-    public IActionResult StopSession(string sessionId)
-    {
-        var session = _sessionManager.GetSession(UserId, sessionId);
-        _logger.LogInformation("StopSession called, UserId: {UserId}, SessionId: {SessionId}, SessionExists: {Exists}, IsProcessing: {IsProcessing}", 
-            UserId, sessionId, session != null, session?.IsProcessing);
-        var result = _sessionManager.StopSession(UserId, sessionId);
-        _logger.LogInformation("StopSession result: {Result}", result);
-        if (!result)
-        {
-            return NotFound(new { message = "会话不存在或没有正在进行的请求" });
-        }
-        return Ok(new { message = "已停止当前请求" });
-    }
-
-    /// <summary>
-    /// 发送消息并获取流式响应（SSE）
-    /// </summary>
-    [HttpPost("sessions/{sessionId}/chat")]
-    public async Task Chat(string sessionId, [FromBody] ChatRequest request, CancellationToken cancellationToken)
-    {
-        var session = _sessionManager.GetSession(UserId, sessionId);
-        if (session == null)
-        {
-            Response.StatusCode = 404;
-            await Response.WriteAsync("会话不存在");
-            return;
-        }
-
-        // 设置 SSE 响应头
-        Response.ContentType = "text/event-stream";
-        Response.Headers.CacheControl = "no-cache";
-        Response.Headers.Connection = "keep-alive";
-
-        try
-        {
-            await foreach (var response in _kernelService.StreamChatAsync(session, request.Message, cancellationToken))
-            {
-                // 构建响应对象
-                if (response.Type == StreamingResponseType.Error)
-                {
-                    // 错误响应,包含详细错误信息
-                    var errorObj = new
-                    {
-                        type = response.Type.ToString().ToLower(),
-                        content = response.Content,
-                        errorCode = response.ErrorCode,
-                        httpStatus = response.HttpStatus,
-                        title = response.ErrorTitle,
-                        reason = response.ErrorReason,
-                        solution = response.ErrorSolution,
-                        isCritical = response.IsCritical
-                    };
-                    
-                    var json = JsonSerializer.Serialize(errorObj);
-                    
-                    // SSE 格式: data: {json}\n\n
-                    await Response.WriteAsync($"data: {json}\n\n", cancellationToken: cancellationToken);
-                    await Response.Body.FlushAsync(cancellationToken);
-                    break; // 遇到细错类型的响应后停止继续发送
-                }
-                else if(response.Type == StreamingResponseType.Exception)
-                {
-                    // 错误响应,包含详细错误信息
-                    var errorObj = new
-                    {
-                        type = response.Type.ToString().ToLower(),
-                        content = response.Content,
-                        errorCode = response.ErrorCode,
-                        httpStatus = response.HttpStatus,
-                        title = response.ErrorTitle,
-                        reason = response.ErrorReason,
-                        solution = response.ErrorSolution,
-                        isCritical = response.IsCritical
-                    };
-
-                    var json = JsonSerializer.Serialize(errorObj);
-
-                    // SSE 格式: data: {json}\n\n
-                    await Response.WriteAsync($"data: {json}\n\n", cancellationToken: cancellationToken);
-                    await Response.Body.FlushAsync(cancellationToken);
-                    break; // 遇到异常类型的响应后停止继续发送
-                }
-                else
-                {
-                    // 普通内容响应
-                    var responseObj = new
-                    {
-                        type = response.Type.ToString().ToLower(),
-                        content = response.Content
-                    };
-                    
-                    var json = JsonSerializer.Serialize(responseObj);
-                    
-                    // SSE 格式: data: {json}\n\n
-                    await Response.WriteAsync($"data: {json}\n\n", cancellationToken: cancellationToken);
-                    await Response.Body.FlushAsync(cancellationToken);
-                }
-            }
-
-            // 发送结束标记
-            await Response.WriteAsync("data: [DONE]\n\n", cancellationToken: cancellationToken);
-            await Response.Body.FlushAsync(cancellationToken);
-        }
-        catch (OperationCanceledException)
-        {
-            _logger.LogInformation("客户端断开连接，SessionId: {SessionId}", sessionId);
-        }
-        catch (Exception ex)
-        {
-            try
-            {
-                _logger.LogError(ex, "聊天处理出错，SessionId: {SessionId}", sessionId);
-                
-                // 使用错误处理器转换异常
-                var errorInfo = _errorHandler.HandleException(ex);
-                _logger.LogWarning("错误信息: {ErrorCode} - {Title}: {Reason}", 
-                    errorInfo.ErrorCode, errorInfo.Title, errorInfo.Reason);
-                
-                // 构建用户友好的错误消息
-                var friendlyErrorMessage = BuildFriendlyErrorMessage(errorInfo);
-                
-                // 将错误信息作为系统消息添加到会话历史中（不影响AI对后续消息的理解）
-                session?.History.AddSystemMessage(friendlyErrorMessage);
-                
-                // 返回错误信息 - 包含用户可读的内容
-                var errorObj = new
-                {
-                    type = "error",
-                    content = friendlyErrorMessage,  // 使用用户友好的错误消息
-                    errorCode = errorInfo.ErrorCode,
-                    httpStatus = errorInfo.HttpStatus,
-                    title = errorInfo.Title,
-                    reason = errorInfo.Reason,
-                    solution = errorInfo.Solution,
-                    isCritical = errorInfo.IsCritical
-                };
-                
-                var json = JsonSerializer.Serialize(errorObj);
-                await Response.WriteAsync($"data: {json}\n\n", cancellationToken: cancellationToken);
-                await Response.WriteAsync($"data: [DONE]\n\n", cancellationToken: cancellationToken);
-            }
-            catch (Exception innerEx)
-            {
-                // 即使错误处理失败，也确保返回一些内容
-                _logger.LogCritical(innerEx, "错误处理也失败了，SessionId: {SessionId}", sessionId);
-                try
-                {
-                    var fallbackError = new
-                    {
-                        type = "error",
-                        content = "系统内部错误，请稍后重试",
-                        errorCode = "InternalError",
-                        httpStatus = 500,
-                        title = "系统错误",
-                        reason = "处理请求时发生内部错误",
-                        solution = "请稍后重试或联系管理员",
-                        isCritical = true
-                    };
-                    
-                    var fallbackJson = JsonSerializer.Serialize(fallbackError);
-                    await Response.WriteAsync($"data: {fallbackJson}\n\n", cancellationToken: cancellationToken);
-                    await Response.WriteAsync($"data: [DONE]\n\n", cancellationToken: cancellationToken);
-                }
-                catch
-                {
-                    // 如果连回退错误都无法发送，至少尝试发送一个简单的错误
-                    await Response.WriteAsync("data: {\"type\":\"error\",\"content\":\"系统错误\"}\n\n", cancellationToken: cancellationToken);
-                }
-            }
-        }
-    }
-
-    /// <summary>
-    /// 发送消息并获取完整响应（非流式，便于 Swagger 测试）
-    /// </summary>
-    [HttpPost("sessions/{sessionId}/chat/complete")]
-    public async Task<IActionResult> ChatComplete(string sessionId, [FromBody] ChatRequest request, CancellationToken cancellationToken)
-    {
-        var session = _sessionManager.GetSession(UserId, sessionId);
-        if (session == null)
-        {
-            return NotFound(new { message = "会话不存在" });
-        }
-
-        var thinkingContent = new List<string>();
-        var responseContent = new List<string>();
-
-        try
-        {
-            await foreach (var response in _kernelService.StreamChatAsync(session, request.Message, cancellationToken))
-            {
-                if (response.Type == StreamingResponseType.Thinking)
-                {
-                    thinkingContent.Add(response.Content);
-                }
-                else
-                {
-                    responseContent.Add(response.Content);
-                }
-            }
-
-            return Ok(new
-            {
-                thinking = thinkingContent.Count > 0 ? string.Join("", thinkingContent) : null,
-                content = string.Join("", responseContent)
-            });
-        }
-        catch (Exception ex)
-        {
-            try
-            {
-                _logger.LogError(ex, "聊天处理出错，SessionId: {SessionId}", sessionId);
-                
-                // 使用错误处理器转换异常
-                var errorInfo = _errorHandler.HandleException(ex);
-                _logger.LogWarning("错误信息: {ErrorCode} - {Title}: {Reason}", 
-                    errorInfo.ErrorCode, errorInfo.Title, errorInfo.Reason);
-                
-                // 构建用户友好的错误消息
-                var friendlyErrorMessage = BuildFriendlyErrorMessage(errorInfo);
-                
-                // 将错误信息作为系统消息添加到会话历史中（不影响AI对后续消息的理解）
-                session?.History.AddSystemMessage(friendlyErrorMessage);
-                
-                return StatusCode(errorInfo.HttpStatus, new 
-                { 
-                    type = "error",
-                    content = friendlyErrorMessage,  // 使用用户友好的错误消息
-                    errorCode = errorInfo.ErrorCode,
-                    httpStatus = errorInfo.HttpStatus,
-                    title = errorInfo.Title,
-                    reason = errorInfo.Reason,
-                    solution = errorInfo.Solution,
-                    isCritical = errorInfo.IsCritical
-                });
-            }
-            catch (Exception innerEx)
-            {
-                // 即使错误处理失败，也确保返回一些内容
-                _logger.LogCritical(innerEx, "错误处理也失败了，SessionId: {SessionId}", sessionId);
-                
-                return StatusCode(500, new 
-                { 
-                    type = "error",
-                    content = "系统内部错误，请稍后重试",
-                    errorCode = "InternalError",
-                    httpStatus = 500,
-                    title = "系统错误",
-                    reason = "处理请求时发生内部错误",
-                    solution = "请稍后重试或联系管理员",
-                    isCritical = true
-                });
-            }
-        }
-    }
-
-    /// <summary>
-    /// 获取会话的聊天历史
-    /// </summary>
-    [HttpGet("sessions/{sessionId}/history")]
-    public IActionResult GetHistory(string sessionId)
-    {
-        var session = _sessionManager.GetSession(UserId, sessionId);
-        if (session == null)
-        {
-            return NotFound(new { message = "会话不存在" });
-        }
-
-        var history = session.History.Select(msg => new
-        {
-            Role = msg.Role.ToString(),
-            Content = msg.Content
-        });
-
-        return Ok(history);
-    }
-
-    /// <summary>
-    /// 构建用户友好的错误消息
-    /// </summary>
-    private static string BuildFriendlyErrorMessage(BailianErrorMessage errorInfo)
-    {
-        // 根据错误类型构建不同的友好消息
-        var errorType = errorInfo.Category switch
-        {
-            BailianErrorCategory.ParameterError => "参数配置问题",
-            BailianErrorCategory.AuthenticationError => "认证失败",
-            BailianErrorCategory.PermissionError => "权限不足",
-            BailianErrorCategory.NotFoundError => "资源不存在",
-            BailianErrorCategory.RateLimitError => "请求频率过高",
-            BailianErrorCategory.ServerError => "服务器内部错误",
-            BailianErrorCategory.FileError => "文件处理问题",
-            BailianErrorCategory.ValidationError => "输入验证失败",
-            BailianErrorCategory.QuotaError => "配额不足",
-            BailianErrorCategory.NetworkError => "网络连接问题",
-            BailianErrorCategory.ContentError => "内容安全检查失败",
-            _ => "系统错误"
-        };
-
-        // 添加时间戳和上下文信息
-        var timestamp = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
-        
-        // 构建更详细的错误消息
-        var isRetryable = !errorInfo.IsCritical;
-        var retryAdvice = isRetryable ? "您可以稍后重试此操作。" : "此错误无法通过重试解决，请按照解决方案进行操作。";
-        
-        return $""""
-抱歉，处理您的请求时遇到了问题：
-
-**错误类型**: {errorType}
-**具体原因**: {errorInfo.Reason}
-**解决方案**: {errorInfo.Solution}
-
-**错误代码**: {errorInfo.ErrorCode}
-**发生时间**: {timestamp}
-**状态**: {(isRetryable ? "可重试" : "严重错误")}
-**建议**: {retryAdvice}
-
-如果您已按照解决方案操作但问题仍然存在，请联系系统管理员。
-"""";
-    }
-}
-```
+**完整项目配置示例**（包含 Swagger 集成、错误处理、并发控制等 v1.1.0 新特性）请参考 [高级用法](#高级用法) 部分的 "完整项目配置示例（v1.1.0）" 章节。
 
 ## 配置项说明
 
@@ -800,7 +408,493 @@ services:
 
 ## 高级用法
 
-### 1. 自定义工具调用
+### 1. 完整项目配置示例（v1.1.0）
+
+#### 1.1 Program.cs 完整配置
+
+```csharp
+using Microsoft.Extensions.Options;
+using SemanticKerne.AiProvider.Unified.Models;
+using SemanticKerne.AiProvider.Unified.Services;
+using SemanticKerne.AiProvider.Unified.Services.Mcp;
+using Microsoft.OpenApi.Models;
+
+var builder = WebApplication.CreateBuilder(args);
+
+// 注册 SemanticKernelOptions 配置
+builder.Services.Configure<SemanticKernelOptions>(
+    builder.Configuration.GetSection("SemanticKernel"));
+
+// 注册核心服务
+builder.Services.AddSingleton<ISemanticKernelService, SemanticKernelService>();
+builder.Services.AddSingleton<ISessionManager, SessionManager>();
+builder.Services.AddSingleton<BailianErrorHandler>();
+
+// 配置 AI 服务的 HttpClient
+builder.Services.AddHttpClient("AIService", client =>
+{
+    client.Timeout = TimeSpan.FromMinutes(5);
+    client.DefaultRequestHeaders.UserAgent.ParseAdd("QW-App/1.0");
+    client.MaxResponseContentBufferSize = 1024 * 1024 * 10; // 10MB
+});
+
+// 注册 MCP 服务
+builder.Services.AddSingleton<IMcpClientService, McpClientService>(sp =>
+{
+    var httpClientFactory = sp.GetRequiredService<IHttpClientFactory>();
+    var logger = sp.GetRequiredService<ILogger<McpClientService>>();
+    return new McpClientService(httpClientFactory, logger, builder.Configuration);
+});
+
+// 配置 Swagger（v1.1.0 新增）
+builder.Services.AddEndpointsApiExplorer();
+builder.Services.AddSwaggerGen(options =>
+{
+    options.SwaggerDoc("v1", new OpenApiInfo
+    {
+        Title = "AI 聊天 API",
+        Version = "v1",
+        Description = "基于 Semantic Kernel 的统一 AI 服务 API"
+    });
+});
+
+var app = builder.Build();
+
+// 启用 Swagger（v1.1.0 新增）
+app.UseSwagger();
+app.UseSwaggerUI(options =>
+{
+    options.SwaggerEndpoint("/swagger/v1/swagger.json", "AI 聊天 API v1");
+});
+
+app.Run();
+```
+
+#### 1.2 控制器完整示例（v1.1.0 增强）
+
+```csharp
+/// <summary>
+/// 聊天控制器
+/// </summary>
+[ApiController]
+[Route("api/[controller]")]
+public class ChatController : ControllerBase
+{
+    // 注意：需要添加以下using语句
+    // using System.Threading;
+    // using Microsoft.AspNetCore.Http.Features;
+    
+    // 限制最大并发 AI 调用数为 5 (根据实际 TPM 调整)
+    private static readonly SemaphoreSlim _aiConcurrencySemaphore = new SemaphoreSlim(5, 5);
+    private readonly ISessionManager _sessionManager;
+    private readonly ISemanticKernelService _kernelService;
+    private readonly ILogger<ChatController> _logger;
+    private readonly BailianErrorHandler _errorHandler;
+
+    public ChatController(
+        ISessionManager sessionManager,
+        ISemanticKernelService kernelService,
+        ILogger<ChatController> logger,
+        BailianErrorHandler errorHandler)
+    {
+        _sessionManager = sessionManager;
+        _kernelService = kernelService;
+        _logger = logger;
+        _errorHandler = errorHandler;
+    }
+
+    private string UserId => User.FindFirst(ClaimTypes.Name)?.Value ?? "test-user";
+
+    /// <summary>
+    /// 获取当前用户的所有会话
+    /// </summary>
+    [HttpGet("sessions")]
+    public IActionResult GetSessions()
+    {
+        _logger.LogInformation("GetSessions called, UserId: {UserId}, AllClaims: {Claims}", 
+            UserId, 
+            string.Join(", ", User.Claims.Select(c => $"{c.Type}={c.Value}")));
+        var sessions = _sessionManager.GetUserSessions(UserId);
+        _logger.LogInformation("GetSessions result, count: {Count}", sessions.Count());
+        return Ok(sessions);
+    }
+
+    /// <summary>
+    /// 创建新的聊天会话
+    /// </summary>
+    [HttpPost("sessions")]
+    public IActionResult CreateSession()
+    {
+        _logger.LogInformation("CreateSession called, UserId: {UserId}", UserId);
+        var session = _sessionManager.CreateSession(UserId);
+        _logger.LogInformation("CreateSession created, SessionId: {SessionId}, UserId: {UserId}", session.SessionId, UserId);
+        return Ok(new CreateSessionResponse
+        {
+            SessionId = session.SessionId,
+            CreatedAt = session.CreatedAt
+        });
+    }
+
+    /// <summary>
+    /// 删除指定的聊天会话
+    /// </summary>
+    [HttpDelete("sessions/{sessionId}")]
+    public IActionResult DeleteSession(string sessionId)
+    {
+        _logger.LogInformation("DeleteSession called, UserId: {UserId}, SessionId: {SessionId}", UserId, sessionId);
+        var result = _sessionManager.DeleteSession(UserId, sessionId);
+        if (!result)
+        {
+            _logger.LogWarning("DeleteSession failed, session not found, UserId: {UserId}, SessionId: {SessionId}", UserId, sessionId);
+            return NotFound(new { message = "会话不存在" });
+        }
+        return NoContent();
+    }
+
+    /// <summary>
+    /// 停止会话当前正在进行的请求（不删除会话）
+    /// </summary>
+    [HttpPost("sessions/{sessionId}/stop")]
+    public IActionResult StopSession(string sessionId)
+    {
+        var session = _sessionManager.GetSession(UserId, sessionId);
+        _logger.LogInformation("StopSession called, UserId: {UserId}, SessionId: {SessionId}, SessionExists: {Exists}, IsProcessing: {IsProcessing}", 
+            UserId, sessionId, session != null, session?.IsProcessing);
+        var result = _sessionManager.StopSession(UserId, sessionId);
+        _logger.LogInformation("StopSession result: {Result}", result);
+        if (!result)
+        {
+            return NotFound(new { message = "会话不存在或没有正在进行的请求" });
+        }
+        return Ok(new { message = "已停止当前请求" });
+    }
+
+    /// <summary>
+    /// 发送消息并获取流式响应（SSE）
+    /// </summary>
+    [HttpPost("sessions/{sessionId}/chat")]
+    public async Task Chat(string sessionId, [FromBody] ChatRequest request, CancellationToken cancellationToken)
+    {
+        // 尝试获取许可，如果拿不到就等待
+        await _aiConcurrencySemaphore.WaitAsync(cancellationToken);
+        var session = _sessionManager.GetSession(UserId, sessionId);
+        if (session == null)
+        {
+            Response.StatusCode = 404;
+            await Response.WriteAsync("会话不存在");
+            return;
+        }
+
+        // 设置 SSE 响应头
+        Response.ContentType = "text/event-stream";
+        Response.Headers.CacheControl = "no-cache";
+        Response.Headers.Connection = "keep-alive";
+
+        // 禁用响应缓冲，确保真正流式输出给前端
+        var bufferingFeature = HttpContext.Features.Get<Microsoft.AspNetCore.Http.Features.IHttpResponseBodyFeature>();
+        bufferingFeature?.DisableBuffering();
+
+        // 用于将字符串直接写入响应流的辅助方法
+        async Task WriteSseDataAsync(string data, CancellationToken ct)
+        {
+            var bytes = System.Text.Encoding.UTF8.GetBytes(data);
+            await Response.Body.WriteAsync(bytes, ct);
+            await Response.Body.FlushAsync(ct);
+        }
+
+        try
+        {
+            await foreach (var response in _kernelService.StreamChatAsync(session, request.Message, cancellationToken))
+            {
+                // 构建响应对象
+                if (response.Type == StreamingResponseType.Error)
+                {
+                    // 错误响应,包含详细错误信息
+                    var errorObj = new
+                    {
+                        type = response.Type.ToString().ToLower(),
+                        content = response.Content,
+                        errorCode = response.ErrorCode,
+                        httpStatus = response.HttpStatus,
+                        title = response.ErrorTitle,
+                        reason = response.ErrorReason,
+                        solution = response.ErrorSolution,
+                        isCritical = response.IsCritical
+                    };
+                    
+                    var json = JsonSerializer.Serialize(errorObj);
+                    
+                    // SSE 格式: data: {json}\n\n
+                    await WriteSseDataAsync($"data: {json}\n\n", cancellationToken);
+                    break; // 遇到错误类型的响应后停止继续发送
+                }
+                else if(response.Type == StreamingResponseType.Exception)
+                {
+                    // 错误响应,包含详细错误信息
+                    var errorObj = new
+                    {
+                        type = response.Type.ToString().ToLower(),
+                        content = response.Content,
+                        errorCode = response.ErrorCode,
+                        httpStatus = response.HttpStatus,
+                        title = response.ErrorTitle,
+                        reason = response.ErrorReason,
+                        solution = response.ErrorSolution,
+                        isCritical = response.IsCritical
+                    };
+
+                    var json = JsonSerializer.Serialize(errorObj);
+
+                    // SSE 格式: data: {json}\n\n
+                    await WriteSseDataAsync($"data: {json}\n\n", cancellationToken);
+                    break; // 遇到异常类型的响应后停止继续发送
+                }
+                else
+                {
+                    // 普通内容响应
+                    var responseObj = new
+                    {
+                        type = response.Type.ToString().ToLower(),
+                        content = response.Content
+                    };
+                    
+                    var json = JsonSerializer.Serialize(responseObj);
+                    
+                    // SSE 格式: data: {json}\n\n
+                    await WriteSseDataAsync($"data: {json}\n\n", cancellationToken);
+                }
+            }
+
+            // 发送结束标记
+            await WriteSseDataAsync("data: [DONE]\n\n", cancellationToken);
+        }
+        catch (OperationCanceledException)
+        {
+            _logger.LogInformation("客户端断开连接，SessionId: {SessionId}", sessionId);
+        }
+        catch (Exception ex)
+        {
+            try
+            {
+                _logger.LogError(ex, "聊天处理出错，SessionId: {SessionId}", sessionId);
+                
+                // 使用错误处理器转换异常
+                var errorInfo = _errorHandler.HandleException(ex);
+                _logger.LogWarning("错误信息: {ErrorCode} - {Title}: {Reason}", 
+                    errorInfo.ErrorCode, errorInfo.Title, errorInfo.Reason);
+                
+                // 构建用户友好的错误消息
+                var friendlyErrorMessage = BuildFriendlyErrorMessage(errorInfo);
+                
+                // 将错误信息作为系统消息添加到会话历史中（不影响AI对后续消息的理解）
+                session?.History.AddSystemMessage(friendlyErrorMessage);
+                
+                // 返回错误信息 - 包含用户可读的内容
+                var errorObj = new
+                {
+                    type = "error",
+                    content = friendlyErrorMessage,  // 使用用户友好的错误消息
+                    errorCode = errorInfo.ErrorCode,
+                    httpStatus = errorInfo.HttpStatus,
+                    title = errorInfo.Title,
+                    reason = errorInfo.Reason,
+                    solution = errorInfo.Solution,
+                    isCritical = errorInfo.IsCritical
+                };
+                
+                var json = JsonSerializer.Serialize(errorObj);
+                await WriteSseDataAsync($"data: {json}\n\n", cancellationToken);
+                await WriteSseDataAsync("data: [DONE]\n\n", cancellationToken);
+            }
+            catch (Exception innerEx)
+            {
+                // 即使错误处理失败，也确保返回一些内容
+                _logger.LogCritical(innerEx, "错误处理也失败了，SessionId: {SessionId}", sessionId);
+                try
+                {
+                    var fallbackError = new
+                    {
+                        type = "error",
+                        content = "系统内部错误，请稍后重试",
+                        errorCode = "InternalError",
+                        httpStatus = 500,
+                        title = "系统错误",
+                        reason = "处理请求时发生内部错误",
+                        solution = "请稍后重试或联系管理员",
+                        isCritical = true
+                    };
+                    
+                    var fallbackJson = JsonSerializer.Serialize(fallbackError);
+                    await WriteSseDataAsync($"data: {fallbackJson}\n\n", cancellationToken);
+                    await WriteSseDataAsync("data: [DONE]\n\n", cancellationToken);
+                }
+                catch
+                {
+                    // 如果连回退错误都无法发送，至少尝试发送一个简单的错误
+                    await WriteSseDataAsync("data: {\"type\":\"error\",\"content\":\"系统错误\"}\n\n", cancellationToken);
+                }
+            }
+        }
+        finally
+        {
+            // 释放许可，让下一个排队的人进来
+            _aiConcurrencySemaphore.Release();
+        }
+    }
+
+    /// <summary>
+    /// 发送消息并获取完整响应（非流式，便于 Swagger 测试）
+    /// </summary>
+    [HttpPost("sessions/{sessionId}/chat/complete")]
+    public async Task<IActionResult> ChatComplete(string sessionId, [FromBody] ChatRequest request, CancellationToken cancellationToken)
+    {
+        var session = _sessionManager.GetSession(UserId, sessionId);
+        if (session == null)
+        {
+            return NotFound(new { message = "会话不存在" });
+        }
+
+        var thinkingContent = new List<string>();
+        var responseContent = new List<string>();
+
+        try
+        {
+            await foreach (var response in _kernelService.StreamChatAsync(session, request.Message, cancellationToken))
+            {
+                if (response.Type == StreamingResponseType.Thinking)
+                {
+                    thinkingContent.Add(response.Content);
+                }
+                else
+                {
+                    responseContent.Add(response.Content);
+                }
+            }
+
+            return Ok(new
+            {
+                thinking = thinkingContent.Count > 0 ? string.Join("", thinkingContent) : null,
+                content = string.Join("", responseContent)
+            });
+        }
+        catch (Exception ex)
+        {
+            try
+            {
+                _logger.LogError(ex, "聊天处理出错，SessionId: {SessionId}", sessionId);
+                
+                // 使用错误处理器转换异常
+                var errorInfo = _errorHandler.HandleException(ex);
+                _logger.LogWarning("错误信息: {ErrorCode} - {Title}: {Reason}", 
+                    errorInfo.ErrorCode, errorInfo.Title, errorInfo.Reason);
+                
+                // 构建用户友好的错误消息
+                var friendlyErrorMessage = BuildFriendlyErrorMessage(errorInfo);
+                
+                // 将错误信息作为系统消息添加到会话历史中（不影响AI对后续消息的理解）
+                session?.History.AddSystemMessage(friendlyErrorMessage);
+                
+                return StatusCode(errorInfo.HttpStatus, new 
+                { 
+                    type = "error",
+                    content = friendlyErrorMessage,  // 使用用户友好的错误消息
+                    errorCode = errorInfo.ErrorCode,
+                    httpStatus = errorInfo.HttpStatus,
+                    title = errorInfo.Title,
+                    reason = errorInfo.Reason,
+                    solution = errorInfo.Solution,
+                    isCritical = errorInfo.IsCritical
+                });
+            }
+            catch (Exception innerEx)
+            {
+                // 即使错误处理失败，也确保返回一些内容
+                _logger.LogCritical(innerEx, "错误处理也失败了，SessionId: {SessionId}", sessionId);
+                
+                return StatusCode(500, new 
+                { 
+                    type = "error",
+                    content = "系统内部错误，请稍后重试",
+                    errorCode = "InternalError",
+                    httpStatus = 500,
+                    title = "系统错误",
+                    reason = "处理请求时发生内部错误",
+                    solution = "请稍后重试或联系管理员",
+                    isCritical = true
+                });
+            }
+        }
+    }
+
+    /// <summary>
+    /// 获取会话的聊天历史
+    /// </summary>
+    [HttpGet("sessions/{sessionId}/history")]
+    public IActionResult GetHistory(string sessionId)
+    {
+        var session = _sessionManager.GetSession(UserId, sessionId);
+        if (session == null)
+        {
+            return NotFound(new { message = "会话不存在" });
+        }
+
+        var history = session.History.Select(msg => new
+        {
+            Role = msg.Role.ToString(),
+            Content = msg.Content
+        });
+
+        return Ok(history);
+    }
+
+    /// <summary>
+    /// 构建用户友好的错误消息
+    /// </summary>
+    private static string BuildFriendlyErrorMessage(BailianErrorMessage errorInfo)
+    {
+        // 根据错误类型构建不同的友好消息
+        var errorType = errorInfo.Category switch
+        {
+            BailianErrorCategory.ParameterError => "参数配置问题",
+            BailianErrorCategory.AuthenticationError => "认证失败",
+            BailianErrorCategory.PermissionError => "权限不足",
+            BailianErrorCategory.NotFoundError => "资源不存在",
+            BailianErrorCategory.RateLimitError => "请求频率过高",
+            BailianErrorCategory.ServerError => "服务器内部错误",
+            BailianErrorCategory.FileError => "文件处理问题",
+            BailianErrorCategory.ValidationError => "输入验证失败",
+            BailianErrorCategory.QuotaError => "配额不足",
+            BailianErrorCategory.NetworkError => "网络连接问题",
+            BailianErrorCategory.ContentError => "内容安全检查失败",
+            _ => "系统错误"
+        };
+
+        // 添加时间戳和上下文信息
+        var timestamp = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
+        
+        // 构建更详细的错误消息
+        var isRetryable = !errorInfo.IsCritical;
+        var retryAdvice = isRetryable ? "您可以稍后重试此操作。" : "此错误无法通过重试解决，请按照解决方案进行操作。";
+        
+        return $"""
+抱歉，处理您的请求时遇到了问题：
+
+**错误类型**: {errorType}
+**具体原因**: {errorInfo.Reason}
+**解决方案**: {errorInfo.Solution}
+
+**错误代码**: {errorInfo.ErrorCode}
+**发生时间**: {timestamp}
+**状态**: {(isRetryable ? "可重试" : "严重错误")}
+**建议**: {retryAdvice}
+
+如果您已按照解决方案操作但问题仍然存在，请联系系统管理员。
+""";
+    }
+}
+```
+
+### 2. 自定义工具调用
 
 ```csharp
 // 创建自定义插件
@@ -820,19 +914,72 @@ public class WeatherPlugin
 kernel.Plugins.AddFromType<WeatherPlugin>("Weather");
 ```
 
-### 2. 多会话管理
+### 3. 压力测试工具使用（v1.1.0 新增）
 
-```csharp
-// 每个会话独立管理历史对话和取消令牌
-var session = await _sessionManager.GetOrCreateSessionAsync(sessionId);
-session.UserId = userId;
-session.History.AddUserMessage(userInput);
+```bash
+# 运行压力测试
+run-stresstest.bat
 
-// 支持会话级别的取消
-session.CancelCurrentRequest();
+# 或手动运行
+cd StressTest
+dotnet run
 ```
 
-### 3. 流式响应前端集成
+**配置示例** (`StressTest/appsettings.json`):
+
+```json
+{
+  "StressTest": {
+    "BaseUrl": "http://localhost:5000",
+    "ConcurrentUsers": 10,
+    "RequestsPerUser": 5,
+    "TestDurationMinutes": 5,
+    "EnableCsvLogging": true,
+    "CsvOutputPath": "stresstest_results.csv",
+    "TestMessages": [
+      "你好",
+      "请介绍一下你自己",
+      "什么是人工智能？",
+      "如何使用 C# 编写 REST API？",
+      "请解释一下什么是微服务架构"
+    ]
+  }
+}
+```
+
+**测试结果示例**:
+
+```
+====================================================================================================
+压力测试结果汇总
+====================================================================================================
+测试时长: 45.23 秒
+总请求数: 50
+成功请求: 48
+失败请求: 2
+成功率: 96.00%
+吞吐量: 1.11 请求/秒
+
+响应时间统计:
+  平均响应时间: 1234.56 ms
+  最小响应时间: 890.12 ms
+  最大响应时间: 2345.67 ms
+
+TTFT（首字延迟）统计:
+  平均 TTFT: 234.56 ms
+  最小 TTFT: 123.45 ms
+  最大 TTFT: 456.78 ms
+  TTFT P50: 234.56 ms
+  TTFT P95: 345.67 ms
+  TTFT P99: 412.34 ms
+
+内容统计:
+  总字符数: 12500
+  平均字符速率: 276.35 字符/秒
+====================================================================================================
+```
+
+### 4. 流式响应前端集成
 
 **JavaScript/TypeScript 示例**：
 
@@ -931,7 +1078,22 @@ function handleStreamingResponse(data: StreamingResponse) {
 
 ## 更新日志
 
-### v1.0.0
+### v1.1.0 (2026-04-21)
+
+- ✨ **压力测试项目** - 新增 `StressTest` 项目，用于测试系统性能
+- ✨ **TTFT 统计** - 支持首字延迟（Time to First Token）精确测量和统计
+- ✨ **并发速率测试** - 支持多用户并发测试和吞吐量统计
+- ✨ **SSE 流式响应测试** - 完整支持 Server-Sent Events 流式测试
+- ✨ **详细性能指标** - 收集响应时间、TTFT 百分位、字符速率等指标
+- ✨ **CSV 日志导出** - 自动导出测试数据为 CSV 格式
+- ✨ **Demo 并发控制** - 新增并发控制功能
+- ✨ **非响应结束后的流式输出** - 支持持续的流式输出
+- ✨ **Log 记录增强** - 完善的日志记录功能
+- ✨ **Swagger 集成** - 支持 API 文档自动生成
+- ✨ **错误处理增强** - 服务功能中增加了 error 的处理
+- ✨ **HttpClient 使用方式优化** - 更改了 httpclient 的使用方式
+
+### v1.0.0 (2026-04-20)
 
 - ✨ 初始版本发布
 - ✨ 支持 OpenAI、Ollama、DashScope 服务商
