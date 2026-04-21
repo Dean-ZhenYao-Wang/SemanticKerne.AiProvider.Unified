@@ -14,6 +14,8 @@ namespace lOT.API.Controllers;
 [Route("api/[controller]")]
 public class ChatController : ControllerBase
 {
+    // 限制最大并发 AI 调用数为 5 (根据实际 TPM 调整)
+    private static readonly SemaphoreSlim _aiConcurrencySemaphore = new SemaphoreSlim(5, 5);
     private readonly ISessionManager _sessionManager;
     private readonly ISemanticKernelService _kernelService;
     private readonly ILogger<ChatController> _logger;
@@ -39,8 +41,8 @@ public class ChatController : ControllerBase
     [HttpGet("sessions")]
     public IActionResult GetSessions()
     {
-        _logger.LogInformation("GetSessions called, UserId: {UserId}, AllClaims: {Claims}", 
-            UserId, 
+        _logger.LogInformation("GetSessions called, UserId: {UserId}, AllClaims: {Claims}",
+            UserId,
             string.Join(", ", User.Claims.Select(c => $"{c.Type}={c.Value}")));
         var sessions = _sessionManager.GetUserSessions(UserId);
         _logger.LogInformation("GetSessions result, count: {Count}", sessions.Count());
@@ -86,7 +88,7 @@ public class ChatController : ControllerBase
     public IActionResult StopSession(string sessionId)
     {
         var session = _sessionManager.GetSession(UserId, sessionId);
-        _logger.LogInformation("StopSession called, UserId: {UserId}, SessionId: {SessionId}, SessionExists: {Exists}, IsProcessing: {IsProcessing}", 
+        _logger.LogInformation("StopSession called, UserId: {UserId}, SessionId: {SessionId}, SessionExists: {Exists}, IsProcessing: {IsProcessing}",
             UserId, sessionId, session != null, session?.IsProcessing);
         var result = _sessionManager.StopSession(UserId, sessionId);
         _logger.LogInformation("StopSession result: {Result}", result);
@@ -103,6 +105,8 @@ public class ChatController : ControllerBase
     [HttpPost("sessions/{sessionId}/chat")]
     public async Task Chat(string sessionId, [FromBody] ChatRequest request, CancellationToken cancellationToken)
     {
+        // 尝试获取许可，如果拿不到就等待
+        await _aiConcurrencySemaphore.WaitAsync(cancellationToken);
         var session = _sessionManager.GetSession(UserId, sessionId);
         if (session == null)
         {
@@ -115,6 +119,18 @@ public class ChatController : ControllerBase
         Response.ContentType = "text/event-stream";
         Response.Headers.CacheControl = "no-cache";
         Response.Headers.Connection = "keep-alive";
+
+        // 禁用响应缓冲，确保真正流式输出给前端
+        var bufferingFeature = HttpContext.Features.Get<Microsoft.AspNetCore.Http.Features.IHttpResponseBodyFeature>();
+        bufferingFeature?.DisableBuffering();
+
+        // 用于将字符串直接写入响应流的辅助方法
+        async Task WriteSseDataAsync(string data, CancellationToken ct)
+        {
+            var bytes = System.Text.Encoding.UTF8.GetBytes(data);
+            await Response.Body.WriteAsync(bytes, ct);
+            await Response.Body.FlushAsync(ct);
+        }
 
         try
         {
@@ -135,15 +151,14 @@ public class ChatController : ControllerBase
                         solution = response.ErrorSolution,
                         isCritical = response.IsCritical
                     };
-                    
+
                     var json = JsonSerializer.Serialize(errorObj);
-                    
+
                     // SSE 格式: data: {json}\n\n
-                    await Response.WriteAsync($"data: {json}\n\n", cancellationToken: cancellationToken);
-                    await Response.Body.FlushAsync(cancellationToken);
-                    break; // 遇到细错类型的响应后停止继续发送
+                    await WriteSseDataAsync($"data: {json}\n\n", cancellationToken);
+                    break; // 遇到错误类型的响应后停止继续发送
                 }
-                else if(response.Type == StreamingResponseType.Exception)
+                else if (response.Type == StreamingResponseType.Exception)
                 {
                     // 错误响应,包含详细错误信息
                     var errorObj = new
@@ -161,8 +176,7 @@ public class ChatController : ControllerBase
                     var json = JsonSerializer.Serialize(errorObj);
 
                     // SSE 格式: data: {json}\n\n
-                    await Response.WriteAsync($"data: {json}\n\n", cancellationToken: cancellationToken);
-                    await Response.Body.FlushAsync(cancellationToken);
+                    await WriteSseDataAsync($"data: {json}\n\n", cancellationToken);
                     break; // 遇到异常类型的响应后停止继续发送
                 }
                 else
@@ -173,18 +187,16 @@ public class ChatController : ControllerBase
                         type = response.Type.ToString().ToLower(),
                         content = response.Content
                     };
-                    
+
                     var json = JsonSerializer.Serialize(responseObj);
-                    
+
                     // SSE 格式: data: {json}\n\n
-                    await Response.WriteAsync($"data: {json}\n\n", cancellationToken: cancellationToken);
-                    await Response.Body.FlushAsync(cancellationToken);
+                    await WriteSseDataAsync($"data: {json}\n\n", cancellationToken);
                 }
             }
 
             // 发送结束标记
-            await Response.WriteAsync("data: [DONE]\n\n", cancellationToken: cancellationToken);
-            await Response.Body.FlushAsync(cancellationToken);
+            await WriteSseDataAsync("data: [DONE]\n\n", cancellationToken);
         }
         catch (OperationCanceledException)
         {
@@ -195,18 +207,18 @@ public class ChatController : ControllerBase
             try
             {
                 _logger.LogError(ex, "聊天处理出错，SessionId: {SessionId}", sessionId);
-                
+
                 // 使用错误处理器转换异常
                 var errorInfo = _errorHandler.HandleException(ex);
-                _logger.LogWarning("错误信息: {ErrorCode} - {Title}: {Reason}", 
+                _logger.LogWarning("错误信息: {ErrorCode} - {Title}: {Reason}",
                     errorInfo.ErrorCode, errorInfo.Title, errorInfo.Reason);
-                
+
                 // 构建用户友好的错误消息
                 var friendlyErrorMessage = BuildFriendlyErrorMessage(errorInfo);
-                
+
                 // 将错误信息作为系统消息添加到会话历史中（不影响AI对后续消息的理解）
                 session?.History.AddSystemMessage(friendlyErrorMessage);
-                
+
                 // 返回错误信息 - 包含用户可读的内容
                 var errorObj = new
                 {
@@ -219,10 +231,10 @@ public class ChatController : ControllerBase
                     solution = errorInfo.Solution,
                     isCritical = errorInfo.IsCritical
                 };
-                
+
                 var json = JsonSerializer.Serialize(errorObj);
-                await Response.WriteAsync($"data: {json}\n\n", cancellationToken: cancellationToken);
-                await Response.WriteAsync($"data: [DONE]\n\n", cancellationToken: cancellationToken);
+                await WriteSseDataAsync($"data: {json}\n\n", cancellationToken);
+                await WriteSseDataAsync("data: [DONE]\n\n", cancellationToken);
             }
             catch (Exception innerEx)
             {
@@ -241,17 +253,22 @@ public class ChatController : ControllerBase
                         solution = "请稍后重试或联系管理员",
                         isCritical = true
                     };
-                    
+
                     var fallbackJson = JsonSerializer.Serialize(fallbackError);
-                    await Response.WriteAsync($"data: {fallbackJson}\n\n", cancellationToken: cancellationToken);
-                    await Response.WriteAsync($"data: [DONE]\n\n", cancellationToken: cancellationToken);
+                    await WriteSseDataAsync($"data: {fallbackJson}\n\n", cancellationToken);
+                    await WriteSseDataAsync("data: [DONE]\n\n", cancellationToken);
                 }
                 catch
                 {
                     // 如果连回退错误都无法发送，至少尝试发送一个简单的错误
-                    await Response.WriteAsync("data: {\"type\":\"error\",\"content\":\"系统错误\"}\n\n", cancellationToken: cancellationToken);
+                    await WriteSseDataAsync("data: {\"type\":\"error\",\"content\":\"系统错误\"}\n\n", cancellationToken);
                 }
             }
+        }
+        finally
+        {
+            // 释放许可，让下一个排队的人进来
+            _aiConcurrencySemaphore.Release();
         }
     }
 
@@ -295,20 +312,20 @@ public class ChatController : ControllerBase
             try
             {
                 _logger.LogError(ex, "聊天处理出错，SessionId: {SessionId}", sessionId);
-                
+
                 // 使用错误处理器转换异常
                 var errorInfo = _errorHandler.HandleException(ex);
-                _logger.LogWarning("错误信息: {ErrorCode} - {Title}: {Reason}", 
+                _logger.LogWarning("错误信息: {ErrorCode} - {Title}: {Reason}",
                     errorInfo.ErrorCode, errorInfo.Title, errorInfo.Reason);
-                
+
                 // 构建用户友好的错误消息
                 var friendlyErrorMessage = BuildFriendlyErrorMessage(errorInfo);
-                
+
                 // 将错误信息作为系统消息添加到会话历史中（不影响AI对后续消息的理解）
                 session?.History.AddSystemMessage(friendlyErrorMessage);
-                
-                return StatusCode(errorInfo.HttpStatus, new 
-                { 
+
+                return StatusCode(errorInfo.HttpStatus, new
+                {
                     type = "error",
                     content = friendlyErrorMessage,  // 使用用户友好的错误消息
                     errorCode = errorInfo.ErrorCode,
@@ -323,9 +340,9 @@ public class ChatController : ControllerBase
             {
                 // 即使错误处理失败，也确保返回一些内容
                 _logger.LogCritical(innerEx, "错误处理也失败了，SessionId: {SessionId}", sessionId);
-                
-                return StatusCode(500, new 
-                { 
+
+                return StatusCode(500, new
+                {
                     type = "error",
                     content = "系统内部错误，请稍后重试",
                     errorCode = "InternalError",
@@ -384,11 +401,11 @@ public class ChatController : ControllerBase
 
         // 添加时间戳和上下文信息
         var timestamp = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
-        
+
         // 构建更详细的错误消息
         var isRetryable = !errorInfo.IsCritical;
         var retryAdvice = isRetryable ? "您可以稍后重试此操作。" : "此错误无法通过重试解决，请按照解决方案进行操作。";
-        
+
         return $""""
 抱歉，处理您的请求时遇到了问题：
 

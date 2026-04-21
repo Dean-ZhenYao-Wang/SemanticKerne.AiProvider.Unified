@@ -20,20 +20,23 @@ namespace SemanticKerne.AiProvider.Unified.Services
         private readonly ILoggerFactory _loggerFactory;
         private readonly ILogger<SemanticKernelService> _logger;
         private readonly IMcpClientService _mcpClient;
+        private readonly IHttpClientFactory _httpClientFactory;
 
-        public SemanticKernelService(IConfiguration configuration, ILoggerFactory loggerFactory, IMcpClientService mcpClient, IOptions<SemanticKernelOptions> options)
+        public SemanticKernelService(IConfiguration configuration, ILoggerFactory loggerFactory, IMcpClientService mcpClient, IOptions<SemanticKernelOptions> options, IHttpClientFactory httpClientFactory)
         {
             _loggerFactory = loggerFactory;
             _logger = loggerFactory.CreateLogger<SemanticKernelService>();
             _mcpClient = mcpClient;
             _options = options.Value;
-            
+
             // 验证配置
             if (!_options.Validate(out var errors))
             {
                 throw new InvalidOperationException(
                     $"Semantic Kernel 配置无效：{string.Join("; ", errors)}");
             }
+
+            _httpClientFactory = httpClientFactory;
         }
 
         public Kernel CreateKernel()
@@ -41,11 +44,8 @@ namespace SemanticKerne.AiProvider.Unified.Services
             var builder = Kernel.CreateBuilder();
 
             builder.Services.AddLogging(services => services.SetMinimumLevel(LogLevel.Information));
-
-            HttpClient _httpClient = new HttpClient()
-            {
-                Timeout = _options.HttpClientTimeout
-            };
+            // 使用 IHttpClientFactory 创建 HttpClient
+            var httpClient = _httpClientFactory.CreateClient("AIService");
             // 根据配置选择 AI 服务
             switch (_options.AiServiceType.ToLower())
             {
@@ -56,7 +56,7 @@ namespace SemanticKerne.AiProvider.Unified.Services
                         modelId: _options.ModelId,
                         endpoint: _options.Endpoint,
                         logger: ollamaLogger,
-                        httpClient: _httpClient);
+                        httpClient: httpClient);
                     builder.Services.AddSingleton<IChatCompletionService>(ollamaService);
                     // 添加 MCP 插件
                     var mcpLogger3 = _loggerFactory.CreateLogger<McpPlugin>();
@@ -79,7 +79,7 @@ namespace SemanticKerne.AiProvider.Unified.Services
                            apiKey: _options.ApiKey,
                            endpoint: _options.Endpoint,
                            logger: dashScopeLogger,
-                           httpClient: _httpClient); // 可传入原生 HttpClient
+                           httpClient: httpClient); // 可传入原生 HttpClient
                     builder.Services.AddSingleton<IChatCompletionService>(dashScopeService);
                     // 🔧 添加 MCP 插件等其他插件
                     var mcpLogger2 = _loggerFactory.CreateLogger<McpPlugin>();
@@ -106,7 +106,7 @@ namespace SemanticKerne.AiProvider.Unified.Services
                         endpoint: new Uri(_options.Endpoint),
                         modelId: _options.ModelId,
                         apiKey: _options.ApiKey,
-                        httpClient: _httpClient);
+                        httpClient: httpClient);
                     break;
                 default:
                     break;
@@ -187,9 +187,11 @@ namespace SemanticKerne.AiProvider.Unified.Services
             private bool _error = false;
             private bool _hasContent = false;
             private int _updateCount = 0;
+            private int _emptyUpdateCount = 0;
             private System.Text.StringBuilder? _aiResponseContent;
             private bool _inThinkingMode = false;
             private string? _pendingNormalContent = null;
+            private const int MaxEmptyUpdatesBeforeEnd = 10;
 
             public StreamingResponseEnumerator(
                 SemanticKernelService service,
@@ -314,6 +316,34 @@ namespace SemanticKerne.AiProvider.Unified.Services
                             };
                             return true;
                         }
+                        // 🔥 处理错误响应（来自 AI 模型的错误）
+                        if (chatUpdate.Metadata != null && chatUpdate.Metadata.TryGetValue("error", out var errorObj))
+                        {
+                            _service._logger.LogError("收到 AI 错误响应: {Error}", errorObj);
+                            var errorMessage = chatUpdate.Metadata.TryGetValue("error_message", out var errorMessageObj)
+                                ? errorMessageObj.ToString()
+                                : "AI 模型返回错误";
+                            var errorType = chatUpdate.Metadata.TryGetValue("error_type", out var errorTypeObj)
+                                ? errorTypeObj.ToString()
+                                : "UnknownError";
+                            var errorCode = chatUpdate.Metadata.TryGetValue("error_code", out var errorCodeObj)
+                                ? errorCodeObj.ToString()
+                                : "400";
+
+                            _current = new StreamingResponse
+                            {
+                                Type = StreamingResponseType.Error,
+                                Content = errorMessage,
+                                ErrorCode = errorType,
+                                HttpStatus = int.TryParse(errorCode, out var status) ? status : 400,
+                                ErrorTitle = "AI 模型错误",
+                                ErrorReason = errorMessage,
+                                ErrorSolution = "请检查输入内容是否过长或格式是否正确",
+                                IsCritical = true
+                            };
+                            _hasContent = true;
+                            return true;
+                        }
 
                         // 🔥 处理 tool_calls（保持 MCP 兼容）
                         if (chatUpdate.Metadata != null && chatUpdate.Metadata.TryGetValue("function_call", out var fcObj) && fcObj is object fc)
@@ -434,6 +464,7 @@ namespace SemanticKerne.AiProvider.Unified.Services
                         {
                             _service._logger.LogInformation("🤔 [流式] 收到 Reasoning: {Reasoning}", reasoningContent);
                             _hasContent = true;
+                            _emptyUpdateCount = 0; // 重置空内容计数器
                             _current = new StreamingResponse { Type = StreamingResponseType.Thinking, Content = reasoningContent };
                             return true;
                         }
@@ -536,7 +567,12 @@ namespace SemanticKerne.AiProvider.Unified.Services
                             }
 
                             _current = new StreamingResponse { Type = responseType, Content = content };
-                            if (responseType != StreamingResponseType.Thinking) _aiResponseContent?.Append(content);
+                            if (responseType != StreamingResponseType.Thinking)
+                            {
+                                _aiResponseContent?.Append(content);
+                                _hasContent = true; // 标记有有效内容
+                                _emptyUpdateCount = 0; // 重置空内容计数器
+                            }
                             return true;
                         }
 
@@ -545,8 +581,12 @@ namespace SemanticKerne.AiProvider.Unified.Services
                         {
                             // 保留工具结果标记，但是不返回给前端
                             _hasContent = true;
+                            _emptyUpdateCount = 0;
                             return await MoveNextAsync();
                         }
+
+                        _emptyUpdateCount++;
+                        _service._logger.LogDebug("空内容更新计数: {EmptyCount}", _emptyUpdateCount);
 
                         return await MoveNextAsync();
                     }
@@ -554,13 +594,14 @@ namespace SemanticKerne.AiProvider.Unified.Services
                     // 处理完成逻辑
                     if (!_completed)
                     {
-                        _service._logger.LogInformation("流式调用结束，总共 {UpdateCount} 个更新，有内容: {HasContent}", _updateCount, _hasContent);
+                        _service._logger.LogInformation("流式调用结束，总共 {UpdateCount} 个更新，有内容: {HasContent}, 连续空更新: {EmptyCount}", _updateCount, _hasContent, _emptyUpdateCount);
 
                         if (_hasContent && _aiResponseContent != null)
                         {
                             var aiResponse = _aiResponseContent.ToString();
                             _session.History.AddAssistantMessage(aiResponse);
                             _service._logger.LogInformation("AI 回复已添加到会话历史，SessionId: {SessionId}", _session.SessionId);
+                            _completed = true;
                         }
                         else if (_updateCount == 0)
                         {
@@ -569,6 +610,26 @@ namespace SemanticKerne.AiProvider.Unified.Services
                             {
                                 Type = StreamingResponseType.Error,
                                 Content = "AI 模型没有返回任何内容"
+                            };
+                            return true;
+                        }
+                        else if (_emptyUpdateCount >= MaxEmptyUpdatesBeforeEnd)
+                        {
+                            _service._logger.LogWarning("连续 {EmptyCount} 次空更新，结束流式调用，SessionId: {SessionId}", _emptyUpdateCount, _session.SessionId);
+                            _current = new StreamingResponse
+                            {
+                                Type = StreamingResponseType.Error,
+                                Content = "AI 模型响应超时（连续无内容）"
+                            };
+                            return true;
+                        }
+                        else
+                        {
+                            _service._logger.LogWarning("AI 模型返回了数据但没有有效内容，连续第 {EmptyCount} 次，SessionId: {SessionId}", _emptyUpdateCount, _session.SessionId);
+                            _current = new StreamingResponse
+                            {
+                                Type = StreamingResponseType.Error,
+                                Content = $"AI 模型响应缓慢（第 {_emptyUpdateCount} 次尝试）"
                             };
                             return true;
                         }

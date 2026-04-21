@@ -99,6 +99,35 @@ namespace SemanticKerne.AiProvider.Unified.Services
                 using (doc)
                 {
                     var root = doc.RootElement;
+                    // 检查是否是错误响应
+                    if (root.TryGetProperty("error", out var errorProp))
+                    {
+                        var errorMessage = errorProp.TryGetProperty("message", out var errorMessageProp)
+                            ? errorMessageProp.GetString()
+                            : "AI 模型返回错误";
+                        var errorType = errorProp.TryGetProperty("type", out var errorTypeProp)
+                            ? errorTypeProp.GetString()
+                            : "UnknownError";
+                        var errorCode = errorProp.TryGetProperty("code", out var errorCodeProp)
+                            ? errorCodeProp.GetInt32()
+                            : 400;
+
+                        _logger.LogError("Ollama 错误响应: {Message} (Type: {Type}, Code: {Code})", errorMessage, errorType, errorCode);
+
+                        yield return new StreamingChatMessageContent(
+                            role: AuthorRole.Assistant,
+                            content: errorMessage,
+                            modelId: _modelId,
+                            metadata: new Dictionary<string, object?>
+                            {
+                                ["error"] = errorProp.ToString(),
+                                ["error_message"] = errorMessage,
+                                ["error_type"] = errorType,
+                                ["error_code"] = errorCode
+                            }
+                        );
+                        break;
+                    }
                     if (root.TryGetProperty("message", out var messageProp))
                     {
                         var role = messageProp.GetProperty("role").GetString();
